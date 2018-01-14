@@ -17,15 +17,16 @@
 
 package org.apache.spark.sql.execution.command
 
-import org.apache.spark.internal.Logging
+import scala.collection.mutable
+
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases
-import org.apache.spark.sql.catalyst.catalog.{CatalogRelation, CatalogStatistics, CatalogTable}
+import org.apache.spark.sql.catalyst.catalog.{CatalogStatistics, CatalogTableType}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.execution.datasources.LogicalRelation
+import org.apache.spark.sql.catalyst.util.ArrayData
+import org.apache.spark.sql.execution.QueryExecution
 
 
 /**
@@ -40,91 +41,117 @@ case class AnalyzeColumnCommand(
     val sessionState = sparkSession.sessionState
     val db = tableIdent.database.getOrElse(sessionState.catalog.getCurrentDatabase)
     val tableIdentWithDB = TableIdentifier(tableIdent.table, Some(db))
-    val relation =
-      EliminateSubqueryAliases(sparkSession.table(tableIdentWithDB).queryExecution.analyzed)
-
-    // Compute total size
-    val (catalogTable: CatalogTable, sizeInBytes: Long) = relation match {
-      case catalogRel: CatalogRelation =>
-        // This is a Hive serde format table
-        (catalogRel.catalogTable,
-          AnalyzeTableCommand.calculateTotalSize(sessionState, catalogRel.catalogTable))
-
-      case logicalRel: LogicalRelation if logicalRel.catalogTable.isDefined =>
-        // This is a data source format table
-        (logicalRel.catalogTable.get,
-          AnalyzeTableCommand.calculateTotalSize(sessionState, logicalRel.catalogTable.get))
-
-      case otherRelation =>
-        throw new AnalysisException("ANALYZE TABLE is not supported for " +
-          s"${otherRelation.nodeName}.")
+    val tableMeta = sessionState.catalog.getTableMetadata(tableIdentWithDB)
+    if (tableMeta.tableType == CatalogTableType.VIEW) {
+      throw new AnalysisException("ANALYZE TABLE is not supported on views.")
     }
+    val sizeInBytes = CommandUtils.calculateTotalSize(sessionState, tableMeta)
 
     // Compute stats for each column
-    val (rowCount, newColStats) =
-      AnalyzeColumnCommand.computeColumnStats(sparkSession, tableIdent.table, relation, columnNames)
+    val (rowCount, newColStats) = computeColumnStats(sparkSession, tableIdentWithDB, columnNames)
 
     // We also update table-level stats in order to keep them consistent with column-level stats.
     val statistics = CatalogStatistics(
       sizeInBytes = sizeInBytes,
       rowCount = Some(rowCount),
       // Newly computed column stats should override the existing ones.
-      colStats = catalogTable.stats.map(_.colStats).getOrElse(Map.empty) ++ newColStats)
+      colStats = tableMeta.stats.map(_.colStats).getOrElse(Map.empty) ++ newColStats)
 
-    sessionState.catalog.alterTable(catalogTable.copy(stats = Some(statistics)))
-
-    // Refresh the cached data source table in the catalog.
-    sessionState.catalog.refreshTable(tableIdentWithDB)
+    sessionState.catalog.alterTableStats(tableIdentWithDB, Some(statistics))
 
     Seq.empty[Row]
   }
-}
-
-object AnalyzeColumnCommand extends Logging {
 
   /**
    * Compute stats for the given columns.
    * @return (row count, map from column name to ColumnStats)
-   *
-   * This is visible for testing.
    */
-  def computeColumnStats(
+  private def computeColumnStats(
       sparkSession: SparkSession,
-      tableName: String,
-      relation: LogicalPlan,
+      tableIdent: TableIdentifier,
       columnNames: Seq[String]): (Long, Map[String, ColumnStat]) = {
 
+    val conf = sparkSession.sessionState.conf
+    val relation = sparkSession.table(tableIdent).logicalPlan
     // Resolve the column names and dedup using AttributeSet
-    val resolver = sparkSession.sessionState.conf.resolver
-    val attributesToAnalyze = AttributeSet(columnNames.map { col =>
-      val exprOption = relation.output.find(attr => resolver(attr.name, col))
+    val attributesToAnalyze = columnNames.map { col =>
+      val exprOption = relation.output.find(attr => conf.resolver(attr.name, col))
       exprOption.getOrElse(throw new AnalysisException(s"Column $col does not exist."))
-    }).toSeq
+    }
 
     // Make sure the column types are supported for stats gathering.
     attributesToAnalyze.foreach { attr =>
       if (!ColumnStat.supportsType(attr.dataType)) {
         throw new AnalysisException(
-          s"Column ${attr.name} in table $tableName is of type ${attr.dataType}, " +
+          s"Column ${attr.name} in table $tableIdent is of type ${attr.dataType}, " +
             "and Spark does not support statistics collection on this column type.")
       }
     }
 
     // Collect statistics per column.
+    // If no histogram is required, we run a job to compute basic column stats such as
+    // min, max, ndv, etc. Otherwise, besides basic column stats, histogram will also be
+    // generated. Currently we only support equi-height histogram.
+    // To generate an equi-height histogram, we need two jobs:
+    // 1. compute percentiles p(0), p(1/n) ... p((n-1)/n), p(1).
+    // 2. use the percentiles as value intervals of bins, e.g. [p(0), p(1/n)],
+    // [p(1/n), p(2/n)], ..., [p((n-1)/n), p(1)], and then count ndv in each bin.
+    // Basic column stats will be computed together in the second job.
+    val attributePercentiles = computePercentiles(attributesToAnalyze, sparkSession, relation)
+
     // The first element in the result will be the overall row count, the following elements
     // will be structs containing all column stats.
     // The layout of each struct follows the layout of the ColumnStats.
-    val ndvMaxErr = sparkSession.sessionState.conf.ndvMaxError
     val expressions = Count(Literal(1)).toAggregateExpression() +:
-        attributesToAnalyze.map(ColumnStat.statExprs(_, ndvMaxErr))
+      attributesToAnalyze.map(ColumnStat.statExprs(_, conf, attributePercentiles))
 
     val namedExpressions = expressions.map(e => Alias(e, e.toString)())
-    val statsRow = Dataset.ofRows(sparkSession, Aggregate(Nil, namedExpressions, relation)).head()
+    val statsRow = new QueryExecution(sparkSession, Aggregate(Nil, namedExpressions, relation))
+      .executedPlan.executeTake(1).head
 
     val rowCount = statsRow.getLong(0)
-    val columnStats = attributesToAnalyze.zipWithIndex.map { case (expr, i) =>
-      (expr.name, ColumnStat.rowToColumnStat(statsRow.getStruct(i + 1)))
+    val columnStats = attributesToAnalyze.zipWithIndex.map { case (attr, i) =>
+      // according to `ColumnStat.statExprs`, the stats struct always have 7 fields.
+      (attr.name, ColumnStat.rowToColumnStat(statsRow.getStruct(i + 1, 7), attr, rowCount,
+        attributePercentiles.get(attr)))
     }.toMap
     (rowCount, columnStats)
   }
+
+  /** Computes percentiles for each attribute. */
+  private def computePercentiles(
+      attributesToAnalyze: Seq[Attribute],
+      sparkSession: SparkSession,
+      relation: LogicalPlan): AttributeMap[ArrayData] = {
+    val attrsToGenHistogram = if (conf.histogramEnabled) {
+      attributesToAnalyze.filter(a => ColumnStat.supportsHistogram(a.dataType))
+    } else {
+      Nil
+    }
+    val attributePercentiles = mutable.HashMap[Attribute, ArrayData]()
+    if (attrsToGenHistogram.nonEmpty) {
+      val percentiles = (0 to conf.histogramNumBins)
+        .map(i => i.toDouble / conf.histogramNumBins).toArray
+
+      val namedExprs = attrsToGenHistogram.map { attr =>
+        val aggFunc =
+          new ApproximatePercentile(attr, Literal(percentiles), Literal(conf.percentileAccuracy))
+        val expr = aggFunc.toAggregateExpression()
+        Alias(expr, expr.toString)()
+      }
+
+      val percentilesRow = new QueryExecution(sparkSession, Aggregate(Nil, namedExprs, relation))
+        .executedPlan.executeTake(1).head
+      attrsToGenHistogram.zipWithIndex.foreach { case (attr, i) =>
+        val percentiles = percentilesRow.getArray(i)
+        // When there is no non-null value, `percentiles` is null. In such case, there is no
+        // need to generate histogram.
+        if (percentiles != null) {
+          attributePercentiles += attr -> percentiles
+        }
+      }
+    }
+    AttributeMap(attributePercentiles.toSeq)
+  }
+
 }

@@ -19,9 +19,9 @@ import warnings
 from collections import namedtuple
 
 from pyspark import since
-from pyspark.rdd import ignore_unicode_prefix
+from pyspark.rdd import ignore_unicode_prefix, PythonEvalType
 from pyspark.sql.dataframe import DataFrame
-from pyspark.sql.functions import UserDefinedFunction
+from pyspark.sql.udf import UserDefinedFunction
 from pyspark.sql.types import IntegerType, StringType, StructType
 
 
@@ -72,10 +72,10 @@ class Catalog(object):
     @ignore_unicode_prefix
     @since(2.0)
     def listTables(self, dbName=None):
-        """Returns a list of tables in the specified database.
+        """Returns a list of tables/views in the specified database.
 
         If no database is specified, the current database is used.
-        This includes all temporary tables.
+        This includes all temporary views.
         """
         if dbName is None:
             dbName = self.currentDatabase()
@@ -115,7 +115,7 @@ class Catalog(object):
     @ignore_unicode_prefix
     @since(2.0)
     def listColumns(self, tableName, dbName=None):
-        """Returns a list of columns for the given table in the specified database.
+        """Returns a list of columns for the given table/view in the specified database.
 
         If no database is specified, the current database is used.
 
@@ -161,14 +161,15 @@ class Catalog(object):
     def createTable(self, tableName, path=None, source=None, schema=None, **options):
         """Creates a table based on the dataset in a data source.
 
-        It returns the DataFrame associated with the external table.
+        It returns the DataFrame associated with the table.
 
         The data source is specified by the ``source`` and a set of ``options``.
         If ``source`` is not specified, the default data source configured by
-        ``spark.sql.sources.default`` will be used.
+        ``spark.sql.sources.default`` will be used. When ``path`` is specified, an external table is
+        created from the data at the given path. Otherwise a managed table is created.
 
         Optionally, a schema can be provided as the schema of the returned :class:`DataFrame` and
-        created external table.
+        created table.
 
         :return: :class:`DataFrame`
         """
@@ -226,33 +227,56 @@ class Catalog(object):
     @ignore_unicode_prefix
     @since(2.0)
     def registerFunction(self, name, f, returnType=StringType()):
-        """Registers a python function (including lambda function) as a UDF
-        so it can be used in SQL statements.
+        """Registers a Python function (including lambda function) or a :class:`UserDefinedFunction`
+        as a UDF. The registered UDF can be used in SQL statement.
 
         In addition to a name and the function itself, the return type can be optionally specified.
         When the return type is not given it default to a string and conversion will automatically
         be done.  For any other return type, the produced object must match the specified type.
 
         :param name: name of the UDF
-        :param f: python function
+        :param f: a Python function, or a wrapped/native UserDefinedFunction
         :param returnType: a :class:`pyspark.sql.types.DataType` object
+        :return: a wrapped :class:`UserDefinedFunction`
 
-        >>> spark.catalog.registerFunction("stringLengthString", lambda x: len(x))
+        >>> strlen = spark.catalog.registerFunction("stringLengthString", len)
         >>> spark.sql("SELECT stringLengthString('test')").collect()
         [Row(stringLengthString(test)=u'4')]
 
+        >>> spark.sql("SELECT 'foo' AS text").select(strlen("text")).collect()
+        [Row(stringLengthString(text)=u'3')]
+
         >>> from pyspark.sql.types import IntegerType
-        >>> spark.catalog.registerFunction("stringLengthInt", lambda x: len(x), IntegerType())
+        >>> _ = spark.catalog.registerFunction("stringLengthInt", len, IntegerType())
         >>> spark.sql("SELECT stringLengthInt('test')").collect()
         [Row(stringLengthInt(test)=4)]
 
         >>> from pyspark.sql.types import IntegerType
-        >>> spark.udf.register("stringLengthInt", lambda x: len(x), IntegerType())
+        >>> _ = spark.udf.register("stringLengthInt", len, IntegerType())
         >>> spark.sql("SELECT stringLengthInt('test')").collect()
         [Row(stringLengthInt(test)=4)]
+
+        >>> import random
+        >>> from pyspark.sql.functions import udf
+        >>> from pyspark.sql.types import IntegerType, StringType
+        >>> random_udf = udf(lambda: random.randint(0, 100), IntegerType()).asNondeterministic()
+        >>> newRandom_udf = spark.catalog.registerFunction("random_udf", random_udf, StringType())
+        >>> spark.sql("SELECT random_udf()").collect()  # doctest: +SKIP
+        [Row(random_udf()=u'82')]
+        >>> spark.range(1).select(newRandom_udf()).collect()  # doctest: +SKIP
+        [Row(random_udf()=u'62')]
         """
-        udf = UserDefinedFunction(f, returnType, name)
+
+        # This is to check whether the input function is a wrapped/native UserDefinedFunction
+        if hasattr(f, 'asNondeterministic'):
+            udf = UserDefinedFunction(f.func, returnType=returnType, name=name,
+                                      evalType=PythonEvalType.SQL_BATCHED_UDF,
+                                      deterministic=f.deterministic)
+        else:
+            udf = UserDefinedFunction(f, returnType=returnType, name=name,
+                                      evalType=PythonEvalType.SQL_BATCHED_UDF)
         self._jsparkSession.udf().registerPython(name, udf._judf)
+        return udf._wrapped()
 
     @since(2.0)
     def isCached(self, tableName):
@@ -276,13 +300,23 @@ class Catalog(object):
 
     @since(2.0)
     def refreshTable(self, tableName):
-        """Invalidate and refresh all the cached metadata of the given table."""
+        """Invalidates and refreshes all the cached data and metadata of the given table."""
         self._jcatalog.refreshTable(tableName)
 
     @since('2.1.1')
     def recoverPartitions(self, tableName):
-        """Recover all the partitions of the given table and update the catalog."""
+        """Recovers all the partitions of the given table and update the catalog.
+
+        Only works with a partitioned table, and not a view.
+        """
         self._jcatalog.recoverPartitions(tableName)
+
+    @since('2.2.0')
+    def refreshByPath(self, path):
+        """Invalidates and refreshes all the cached data (and the associated metadata) for any
+        DataFrame that contains the given data source path.
+        """
+        self._jcatalog.refreshByPath(path)
 
     def _reset(self):
         """(Internal use only) Drop all existing databases (except "default"), tables,
